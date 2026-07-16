@@ -1,0 +1,9 @@
+repos:
+  - repo: local
+    hooks:
+      - id: circle-orb-validate
+        name: Validate CircleCI Orbs
+        entry: circleci orb validate
+        language: system
+        types: [yaml]
+        files: zeek-utils.yml
