@@ -1,0 +1,153 @@
+version: 2.1
+
+description: >
+  Utilities for defining CircleCI configurations across the Zeek org
+
+commands:
+  clone_repo:
+    description: >
+      Extension of the `checkout` command to allow recursively updating submodules and
+      checking out external test pcaps.
+    parameters:
+      include_submodules:
+        description: Flag for whether to recursively update submodules after cloning
+        type: boolean
+        default: true
+      include_external_tests:
+        description: Flag for whether to include the external test repos/data after cloning
+        type: boolean
+        default: true
+    steps:
+      - checkout
+      - when:
+          condition: << parameters.include_submodules >>
+          steps:
+            - run:
+                name: Update submodules
+                command: git submodule update --recursive --init --recommend-shallow -j ${ZEEK_CI_CPUS}
+      - when:
+          condition: << parameters.include_external_tests >>
+          steps:
+            - attach_workspace:
+                name: Attach workspace with zeek-testing pcaps
+                at: .
+            - run:
+                name: Initialize external testing repos
+                command: ci/init-external-repos.sh
+
+  setup_ccache:
+    description: >
+      Sets up ccache with various parameters.
+    parameters:
+      max_size:
+        description: Flag that matches the max_size ccache argument
+        type: string
+        default: 1000M
+      max_files:
+        description: Flag that matches the max_files ccache argument
+        type: integer
+        default: 20000
+      path:
+        description: The path where cache files are stored
+        type: string
+    steps:
+      - run:
+          name: Setup ccache
+          command: |
+            mkdir -p "<< parameters.path >>"
+            ccache --set-config=max_size=<< parameters.max_size >>
+            ccache --set-config=max_files=<< parameters.max_files >>
+            ccache --set-config=compression=true
+            ccache --set-config=cache_dir="<< parameters.path >>"
+            ccache --zero-stats
+            ccache --show-stats
+          shell: bash
+
+jobs:
+  create-build-image:
+    description: >
+      Creates a image used for building other jobs in the zeek/zeek-ci DockerHub
+      repository. This image named based on the filename of the job and is versioned based
+      on the DOCKERFILE_VERSION in the Dockerfile provided.
+    parameters:
+      build_arm:
+        description: Flag for whether to build an ARM variant of the image
+        type: boolean
+        default: false
+    docker:
+      - image: cimg/base:current
+    resource_class: medium
+    steps:
+      # TODO: Add a step to flush old images out of the cache. Maybe loop through what's
+      # available for each image name and keep the last three versions minus what's on
+      # the master branch?
+      - checkout
+      - run:
+          name: Set extra environment variables
+          command: |
+            if << parameters.build_arm >>; then
+              echo "export PLATFORMS='linux/amd64,linux/arm64'" >> "$BASH_ENV"
+            else
+              echo "export PLATFORMS='linux/amd64'" >> "$BASH_ENV"
+            fi
+
+            IMAGE_NAME=$(echo $CIRCLE_JOB | cut -d- -f 3-)
+            DOCKERFILE_PATH=ci/$IMAGE_NAME/Dockerfile
+            IMAGE_VERSION=$(awk -F= '/DOCKERFILE_VERSION/ {print $2}' $DOCKERFILE_PATH)
+
+            if [ -z "${IMAGE_VERSION}" ]; then
+               echo "DOCKERFILE_VERSION environment variable was missing from ${DOCKERFILE_PATH}. This is"
+               echo "needed in order to build the images used later in the build process."
+               exit 1
+            fi
+
+            echo "export IMAGE_NAME=$IMAGE_NAME" >> "$BASH_ENV"
+            echo "export DOCKERFILE_PATH=$DOCKERFILE_PATH" >> "$BASH_ENV"
+            echo "export IMAGE_VERSION=$IMAGE_VERSION" >> "$BASH_ENV"
+            echo "export FULL_IMAGE_TAG=zeek/zeek-ci:$IMAGE_NAME-$IMAGE_VERSION" >> "$BASH_ENV"
+      # See https://circleci.com/docs/guides/execution-managed/building-docker-images/ for docs
+      # on what this does.
+      - setup_remote_docker
+      - run:
+          name: Set up Docker Buildx
+          command: |
+            docker buildx create --use --name multiarch-builder --driver docker-container
+            docker buildx inspect --bootstrap
+      - run:
+          name: Log in to Docker Hub
+          command: echo "$DOCKER_PASSWORD" | docker login -u "$DOCKER_LOGIN" --password-stdin
+      - run:
+          name: Check if image exists remotely
+          command: |
+            # set +e prevents this script from exiting immediately if one of the commands fails.
+            # By default the commands use pipefail, which is overridden by set +e.
+            set +e
+
+            # If the image already exists for this version, we can just exit out of the job.
+            # See https://circleci.com/docs/reference/configuration-reference/#ending-a-job-from-within-a-step.
+            if << parameters.build_arm >>; then
+               NUM_LINES=$(docker manifest inspect $FULL_IMAGE_TAG 2>/dev/null | grep -c -E "amd64|arm64")
+               if [ $NUM_LINES -eq 2 ]; then
+                 echo "Both amd64 and arm64 images already exist for $FULL_IMAGE_TAG, exiting"
+                 circleci-agent step halt
+               else
+                 echo "Either amd64 or arm64 images are missing from $FULL_IMAGE_TAG, continuing with build"
+               fi
+            else
+               NUM_LINES=$(docker manifest inspect $FULL_IMAGE_TAG 2>/dev/null | grep -c -E "amd64")
+               if [ $NUM_LINES -eq 1 ]; then
+                 echo "$FULL_IMAGE_TAG already exists, exiting"
+                 circleci-agent step halt
+               else
+                 echo "$FULL_IMAGE_TAG is missing, continuing with build"
+               fi
+            fi
+      - run:
+          name: Build and push multi-arch image
+          command: |
+            docker buildx build \
+              --platform $PLATFORMS \
+              --file $DOCKERFILE_PATH \
+              --tag $FULL_IMAGE_TAG \
+              --push \
+              .
